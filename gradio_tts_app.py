@@ -39,6 +39,12 @@ def split_into_sentences(text: str) -> list[str]:
     
     return sentences
 
+def maybe_split_text(text: str, split_sentences: bool) -> list[str]:
+    text = text.strip()
+    if not split_sentences:
+        return [text]
+    return split_into_sentences(text)
+
 
 def load_model():
     print("Loading model...")
@@ -61,16 +67,21 @@ def get_cached_conds(audio_prompt_path):
     return _cond_cache[audio_prompt_path]
 
 def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
+             split_sentences: bool,
              diffusion_steps,
              min_p, top_p, repetition_penalty):
     if seed_num != 0:
         set_seed(int(seed_num))
+    else:
+        global config_seed
+        config_seed = None
 
     s3gen_ref, cond_emb = get_cached_conds(audio_prompt_path)
     cond_emb = global_model.update_exaggeration(cond_emb, exaggeration=exaggeration)
 
-    # Split text into sentences for parallel processing
-    sentences = split_into_sentences(text)
+    # Splitting improves vLLM batching, but S3Gen runs per-chunk; for short clips
+    # it's often faster to keep a single chunk.
+    sentences = maybe_split_text(text, split_sentences=split_sentences)
     
     t0 = time.perf_counter()
     print(f"[GENERATE] Split into {len(sentences)} sentences: {[len(s) for s in sentences]}")
@@ -87,6 +98,7 @@ def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
         seed=config_seed,
+        clear_cuda_cache=False,
     )
 
     # Concatenate all audio chunks in order
@@ -106,6 +118,10 @@ with gr.Blocks() as demo:
                 value="Hey! How's it going? I'm glad to see you here. Let's get to know each other shall we? There are so many things I need to talk to you about!",
                 label="Text to synthesize (max chars 300)",
                 max_lines=5
+            )
+            split_sentences = gr.Checkbox(
+                value=True,
+                label="Batch by sentence (usually faster for short clips)",
             )
             ref_wav = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio File", value=None)
             exaggeration = gr.Slider(0.25, 2, step=.05, label="Exaggeration (Neutral = 0.5, extreme values can be unstable)", value=.5)
@@ -131,6 +147,7 @@ with gr.Blocks() as demo:
             exaggeration,
             temp,
             seed_num,
+            split_sentences,
             diffusion_steps,
             min_p,
             top_p,

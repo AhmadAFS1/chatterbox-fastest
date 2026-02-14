@@ -290,6 +290,11 @@ class ChatterboxTTS:
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
     ) -> list[any]:
+        # Internal controls (not vLLM SamplingParams). Keep these in kwargs to avoid
+        # breaking positional-callers, and strip before constructing SamplingParams.
+        clear_cuda_cache = bool(kwargs.pop("clear_cuda_cache", True))
+        s3gen_oom_retries = int(kwargs.pop("s3gen_oom_retries", 1))
+
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -314,6 +319,29 @@ class ChatterboxTTS:
 
         with torch.inference_mode():
             start_time = time.time()
+            try:
+                sampling_params = SamplingParams(
+                    temperature=temperature,
+                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                    max_tokens=min(max_tokens, self.max_model_len),
+                    top_p=top_p,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    *args, **kwargs,
+                )
+            except TypeError as e:
+                # `min_p` support depends on vLLM version; fall back if unsupported.
+                if "min_p" not in str(e):
+                    raise
+                sampling_params = SamplingParams(
+                    temperature=temperature,
+                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                    max_tokens=min(max_tokens, self.max_model_len),
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    *args, **kwargs,
+                )
+
             batch_results = self.t3.generate(
                 [
                     {
@@ -324,22 +352,13 @@ class ChatterboxTTS:
                     }
                     for text in prompts
                 ],
-                sampling_params=SamplingParams(
-                    temperature=temperature,
-
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                    max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-
-                    *args, **kwargs,
-                )
+                sampling_params=sampling_params,
             )
             t3_gen_time = time.time() - start_time
             print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
-            # run torch gc
-            torch.cuda.empty_cache()
+            if clear_cuda_cache:
+                torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
@@ -348,19 +367,30 @@ class ChatterboxTTS:
                     if i % 5 == 0:
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
-                    # Run gc every 10 prompts
-                    if i % 10 == 0:
+                    # Periodic cache clears help on low-VRAM cards, but they add sync overhead.
+                    if clear_cuda_cache and i % 10 == 0:
                         torch.cuda.empty_cache()
 
-                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
+                    speech_tokens = torch.tensor(output.token_ids, device=self.target_device, dtype=torch.long)
+                    speech_tokens = speech_tokens - SPEECH_TOKEN_OFFSET
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
 
-                    wav, _ = self.s3gen.inference(
-                        speech_tokens=speech_tokens,
-                        ref_dict=s3gen_ref,
-                        n_timesteps=diffusion_steps,
-                    )
+                    # Retry once on CUDA OOM; avoids paying `empty_cache()` sync cost on every call.
+                    for attempt in range(max(0, s3gen_oom_retries) + 1):
+                        try:
+                            wav, _ = self.s3gen.inference(
+                                speech_tokens=speech_tokens,
+                                ref_dict=s3gen_ref,
+                                n_timesteps=diffusion_steps,
+                            )
+                            break
+                        except RuntimeError as e:
+                            is_oom = "out of memory" in str(e).lower()
+                            if attempt < s3gen_oom_retries and is_oom and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                continue
+                            raise
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
