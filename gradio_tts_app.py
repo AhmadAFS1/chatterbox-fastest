@@ -1,5 +1,8 @@
 import random
 import os
+import re
+import time
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -23,67 +26,96 @@ def set_seed(seed: int):
     config_seed = seed
 
 
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into sentences at natural boundaries."""
+    # Split on sentence-ending punctuation followed by space
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Filter empty strings and whitespace-only
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    # If only 1 sentence or very short text, return as-is
+    if len(sentences) <= 1:
+        return [text.strip()]
+    
+    return sentences
+
+
 def load_model():
     print("Loading model...")
     global global_model
     global_model = ChatterboxTTS.from_pretrained(
-        gpu_memory_utilization = 0.6,
-        max_model_len = 1000,
-
-        # Disable CUDA graphs - it's causing tensors to get corrupted right now.
-        enforce_eager = True,
+        max_batch_size = 10,   # Allow batching up to 10 sentences
+        gpu_memory_utilization = 0.8,
+        max_model_len = 500,
+        # enforce_eager removed — CUDA graphs enabled
     )
     return global_model
 
+# Cache audio conditioning per reference file
+_cond_cache = {}
+
+def get_cached_conds(audio_prompt_path):
+    if audio_prompt_path not in _cond_cache:
+        s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+        _cond_cache[audio_prompt_path] = (s3gen_ref, cond_emb)
+    return _cond_cache[audio_prompt_path]
+
 def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
-             #cfgw,
              diffusion_steps,
              min_p, top_p, repetition_penalty):
     if seed_num != 0:
         set_seed(int(seed_num))
 
-    print(f"Using text: {text}")
-    print(f"Using audio_prompt_path: {audio_prompt_path}")
-    print(f"Using seed: {config_seed}")
-    print(f"Using temperature: {temperature}")
-    print(f"Using exaggeration: {exaggeration}")
-    print(f"Using min_p: {min_p}")
-    print(f"Using top_p: {top_p}")
-    print(f"Using repetition_penalty: {repetition_penalty}")
+    s3gen_ref, cond_emb = get_cached_conds(audio_prompt_path)
+    cond_emb = global_model.update_exaggeration(cond_emb, exaggeration=exaggeration)
 
-    wav = global_model.generate(
-        [text],
-        audio_prompt_path=audio_prompt_path,
-        exaggeration=exaggeration,
+    # Split text into sentences for parallel processing
+    sentences = split_into_sentences(text)
+    
+    t0 = time.perf_counter()
+    print(f"[GENERATE] Split into {len(sentences)} sentences: {[len(s) for s in sentences]}")
+    for i, s in enumerate(sentences):
+        print(f"  [{i}] {s[:60]}...")
+
+    wavs = global_model.generate_with_conds(
+        sentences,  # ALL sentences processed in parallel by VLLM
+        s3gen_ref=s3gen_ref,
+        cond_emb=cond_emb,
         temperature=temperature,
-        # cfg_weight=cfgw,
         diffusion_steps=diffusion_steps,
         min_p=min_p,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
         seed=config_seed,
     )
-    return (global_model.sr, wav[0].squeeze(0).numpy())
+
+    # Concatenate all audio chunks in order
+    combined = torch.cat([w.squeeze(0) for w in wavs], dim=-1)
+    
+    elapsed = time.perf_counter() - t0
+    audio_duration = combined.shape[-1] / global_model.sr
+    print(f"[GENERATE] {elapsed:.2f}s for {audio_duration:.1f}s audio ({audio_duration/elapsed:.1f}x realtime) | {len(sentences)} sentences batched")
+
+    return (global_model.sr, combined.numpy())
 
 
 with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column():
             text = gr.Textbox(
-                value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible.",
+                value="Hey! How's it going? I'm glad to see you here. Let's get to know each other shall we? There are so many things I need to talk to you about!",
                 label="Text to synthesize (max chars 300)",
                 max_lines=5
             )
             ref_wav = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio File", value=None)
             exaggeration = gr.Slider(0.25, 2, step=.05, label="Exaggeration (Neutral = 0.5, extreme values can be unstable)", value=.5)
-            # cfg_weight = gr.Slider(0.0, 1, step=.05, label="CFG/Pace", value=0.5)
 
             with gr.Accordion("More options", open=False):
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
-                diffusion_steps = gr.Slider(1, 15, step=1, label="Diffusion Steps (more = slower and higher quality)", value=10)
+                diffusion_steps = gr.Slider(1, 15, step=1, label="Diffusion Steps (more = slower and higher quality)", value=4)
                 temp = gr.Slider(0.05, 5, step=.05, label="temperature", value=.8)
-                min_p = gr.Slider(0.00, 1.00, step=0.01, label="min_p || Newer Sampler. Recommend 0.02 > 0.1. Handles Higher Temperatures better. 0.00 Disables", value=0.05)
-                top_p = gr.Slider(0.00, 1.00, step=0.01, label="top_p || Original Sampler. 1.0 Disables(recommended). Original 0.8", value=1.00)
+                min_p = gr.Slider(0.00, 1.00, step=0.01, label="min_p", value=0.05)
+                top_p = gr.Slider(0.00, 1.00, step=0.01, label="top_p", value=1.00)
                 repetition_penalty = gr.Slider(1.00, 2.00, step=0.1, label="repetition_penalty", value=1.2)
 
             run_btn = gr.Button("Generate", variant="primary")
@@ -99,7 +131,6 @@ with gr.Blocks() as demo:
             exaggeration,
             temp,
             seed_num,
-            #cfg_weight,
             diffusion_steps,
             min_p,
             top_p,
@@ -109,7 +140,6 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
-    # Don't let Gradio manage the model loading, it's causing issues.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     load_model()
 
