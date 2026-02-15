@@ -229,11 +229,20 @@ class MTLTokenizer(PreTrainedTokenizer):
         """
         Text preprocessor that handles lowercase conversion and NFKD normalization.
         """
+        # Preserve special tokens like [START]/[STOP] during normalization. These are
+        # control tokens in the Chatterbox data format and must remain intact.
         preprocessed_text = raw_text
+        protected: dict[str, str] = {}
+        for i, tok in enumerate(SPECIAL_TOKENS):
+            marker = f"__cbx_special_{i}__"
+            protected[marker] = tok
+            preprocessed_text = preprocessed_text.replace(tok, marker)
         if lowercase:
             preprocessed_text = preprocessed_text.lower()
         if nfkd_normalize:
             preprocessed_text = normalize("NFKD", preprocessed_text)
+        for marker, tok in protected.items():
+            preprocessed_text = preprocessed_text.replace(marker, tok)
         
         return preprocessed_text
 

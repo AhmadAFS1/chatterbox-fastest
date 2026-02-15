@@ -10,6 +10,7 @@ import gradio as gr
 import torchaudio as ta
 
 from chatterbox_vllm.tts import ChatterboxTTS
+from chatterbox_vllm.text_utils import SUPPORTED_LANGUAGES
 
 DEVICE = "cuda"
 
@@ -49,9 +50,9 @@ def maybe_split_text(text: str, split_sentences: bool) -> list[str]:
 def load_model():
     print("Loading model...")
     global global_model
-    global_model = ChatterboxTTS.from_pretrained(
+    global_model = ChatterboxTTS.from_pretrained_multilingual(
         max_batch_size = 10,   # Allow batching up to 10 sentences
-        gpu_memory_utilization = 0.8,
+        gpu_memory_utilization = 0.5,
         max_model_len = 500,
         # enforce_eager removed — CUDA graphs enabled
     )
@@ -68,6 +69,7 @@ def get_cached_conds(audio_prompt_path):
 
 def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
              split_sentences: bool,
+             language_id: str,
              diffusion_steps,
              min_p, top_p, repetition_penalty):
     if seed_num != 0:
@@ -93,6 +95,7 @@ def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
         s3gen_ref=s3gen_ref,
         cond_emb=cond_emb,
         temperature=temperature,
+        language_id=language_id,
         diffusion_steps=diffusion_steps,
         min_p=min_p,
         top_p=top_p,
@@ -118,6 +121,12 @@ with gr.Blocks() as demo:
                 value="Hey! How's it going? I'm glad to see you here. Let's get to know each other shall we? There are so many things I need to talk to you about!",
                 label="Text to synthesize (max chars 300)",
                 max_lines=5
+            )
+            language = gr.Dropdown(
+                choices=[(f"{k} - {v}", k) for k, v in SUPPORTED_LANGUAGES.items()],
+                value="en",
+                type="value",
+                label="Language",
             )
             split_sentences = gr.Checkbox(
                 value=True,
@@ -148,6 +157,7 @@ with gr.Blocks() as demo:
             temp,
             seed_num,
             split_sentences,
+            language,
             diffusion_steps,
             min_p,
             top_p,
