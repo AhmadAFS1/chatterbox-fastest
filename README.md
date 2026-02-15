@@ -40,7 +40,7 @@ DISCLAIMER: THIS IS A PERSONAL PROJECT and is not affiliated with my employer or
   * Until then, this is a Rube Goldberg machine that will likely only work with vLLM 0.9.2.
   * Follow https://github.com/vllm-project/vllm/issues/21989 for updates.
 * ℹ️ Substantial refactoring is needed to further clean up unnecessary workarounds and code paths.
-* ℹ️ Server API is not implemented and will likely be out-of-scope for this project.
+* ℹ️ An optional FastAPI reference server is available via `tts_api_server.py` (community-maintained, unstable API).
 * ❌ Learned speech positional embeddings are not applied, pending support in vLLM. However, this doesn't seem to be causing a very noticeable degradation in quality.
 * ❌ APIs are not yet stable and may change.
 * ❌ Benchmarks and performance optimizations are not yet implemented.
@@ -96,6 +96,39 @@ if __name__ == "__main__":
         audios = model.generate(prompts, audio_prompt_path=audio_prompt_path, exaggeration=0.8)
         for audio_idx, audio in enumerate(audios):
             ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
+```
+
+# FastAPI Server (Optional)
+
+An HTTP server is available at `tts_api_server.py` for request/response TTS generation.
+
+```bash
+source .venv/bin/activate
+CHATTERBOX_MODEL_VARIANT=multilingual \
+CHATTERBOX_GPU_MEMORY_UTILIZATION=0.5 \
+python tts_api_server.py
+```
+
+The server exposes:
+* `GET /healthz`
+* `GET /v1/languages`
+* `POST /v1/tts` (multipart form; returns WAV audio)
+
+Example request with voice cloning:
+```bash
+curl -X POST "http://127.0.0.1:8000/v1/tts" \
+  -F "text=Hey! How is it going? I am glad to see you here." \
+  -F "audio_prompt=@docs/audio-sample-01.mp3" \
+  -F "language_id=en" \
+  -F "split_sentences=true" \
+  -F "exaggeration=0.5" \
+  -F "temperature=0.8" \
+  -F "diffusion_steps=4" \
+  -F "min_p=0.05" \
+  -F "top_p=1.0" \
+  -F "repetition_penalty=1.2" \
+  -F "seed=0" \
+  --output out.wav
 ```
 
 # Multilingual

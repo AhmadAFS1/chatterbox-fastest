@@ -1,0 +1,68 @@
+@host = http://127.0.0.1:8000
+
+### Health check
+GET {{host}}/healthz
+
+### List supported languages
+GET {{host}}/v1/languages
+
+### TTS sample (no voice clone audio)
+# Saves audio to ./out-no-clone.wav
+POST {{host}}/v1/tts
+Content-Type: application/x-www-form-urlencoded
+
+text=Hey%21%20How%27s%20it%20going%3F%20I%27m%20glad%20to%20see%20you%20here.&language_id=en&split_sentences=true&exaggeration=0.5&temperature=0.8&diffusion_steps=4&min_p=0.05&top_p=1.0&repetition_penalty=1.2&seed=0
+>> ./out-no-clone.wav
+
+### TTS sample (with voice clone audio)
+# Saves audio to ./out-clone.wav
+POST {{host}}/v1/tts
+Content-Type: multipart/form-data; boundary=MyBoundary
+
+--MyBoundary
+Content-Disposition: form-data; name="text"
+
+Hey! How's it going? I'm glad to see you here.
+--MyBoundary
+Content-Disposition: form-data; name="language_id"
+
+en
+--MyBoundary
+Content-Disposition: form-data; name="split_sentences"
+
+true
+--MyBoundary
+Content-Disposition: form-data; name="exaggeration"
+
+0.5
+--MyBoundary
+Content-Disposition: form-data; name="temperature"
+
+0.8
+--MyBoundary
+Content-Disposition: form-data; name="diffusion_steps"
+
+4
+--MyBoundary
+Content-Disposition: form-data; name="min_p"
+
+0.05
+--MyBoundary
+Content-Disposition: form-data; name="top_p"
+
+1.0
+--MyBoundary
+Content-Disposition: form-data; name="repetition_penalty"
+
+1.2
+--MyBoundary
+Content-Disposition: form-data; name="seed"
+
+0
+--MyBoundary
+Content-Disposition: form-data; name="audio_prompt"; filename="audio-sample-01.mp3"
+Content-Type: audio/mpeg
+
+< ./docs/audio-sample-01.mp3
+--MyBoundary--
+>> ./out-clone.wav
