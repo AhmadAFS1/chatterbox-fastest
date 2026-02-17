@@ -22,7 +22,7 @@ Content-Type: multipart/form-data; boundary=MyBoundary
 --MyBoundary
 Content-Disposition: form-data; name="text"
 
-Hey! How's it going? I'm glad to see you here.
+Hey! How's it going? I'm glad to see you here. Let's get to know each other. Shall we?
 --MyBoundary
 Content-Disposition: form-data; name="language_id"
 
@@ -30,7 +30,7 @@ en
 --MyBoundary
 Content-Disposition: form-data; name="split_sentences"
 
-true
+false
 --MyBoundary
 Content-Disposition: form-data; name="exaggeration"
 
@@ -63,6 +63,6 @@ Content-Disposition: form-data; name="seed"
 Content-Disposition: form-data; name="audio_prompt"; filename="audio-sample-01.mp3"
 Content-Type: audio/mpeg
 
-< ./docs/audio-sample-01.mp3
+< ./docs/speech-2.wav
 --MyBoundary--
 >> ./out-clone.wav
