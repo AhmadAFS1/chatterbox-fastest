@@ -1,0 +1,16 @@
+[Unit]
+Description=Chatterbox FastAPI TTS Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/chatterbox-fastest
+ExecStart=/chatterbox-fastest/easy_start.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,6 @@ This document analyzes the repository file-by-file based on the current working 
 
 Included:
 - All source-controlled files returned by `git ls-files`
-- The untracked helper script `easy_start.sh`
 
 Excluded:
 - `.venv/`
@@ -144,9 +143,18 @@ At a high level:
 - Builds a source distribution and uploads the tarball to PyPI with `twine`.
 
 #### `easy_start.sh`
-- Untracked convenience script in the current workspace.
-- Activates the virtualenv, sets multilingual mode plus a lower GPU utilization target, and launches `tts_api_server.py`.
-- This is a local startup shortcut rather than core project logic.
+- Repo-local launcher for the FastAPI server.
+- Loads optional environment overrides from `chatterbox-server.env`, applies safe startup defaults, validates the virtualenv Python path, and launches `tts_api_server.py`.
+- Suitable for manual starts and for use behind a boot-time service manager like `systemd`.
+
+#### `chatterbox-server.env.example`
+- Template environment file for server runtime configuration.
+- Documents the main knobs exposed by `tts_api_server.py`, including model variant, GPU memory allocation, batching, cache size, and bind host/port.
+- Intended to be copied to a local `chatterbox-server.env` file that stays out of version control.
+
+#### `chatterbox-fastest.service`
+- Linux `systemd` unit file for running the FastAPI server automatically on boot.
+- Uses `easy_start.sh` as the `ExecStart` entrypoint and enables restart-on-failure behavior for the TTS API process.
 
 ### Model Config Directories
 

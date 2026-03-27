@@ -1,5 +1,7 @@
 # Chatterbox TTS on vLLM
 
+Repository: https://github.com/AhmadAFS1/chatterbox-fastest
+
 This is a port of https://github.com/resemble-ai/chatterbox to vLLM. Why?
 
 * Improved performance and more efficient use of GPU memory.
@@ -52,8 +54,8 @@ This project only supports Linux and WSL2 with Nvidia hardware. AMD _may_ work w
 Prerequisites: `git` and [`uv`](https://pypi.org/project/uv/) must be installed
 
 ```
-git clone https://github.com/randombk/chatterbox-vllm.git
-cd chatterbox-vllm
+git clone https://github.com/AhmadAFS1/chatterbox-fastest.git
+cd chatterbox-fastest
 uv venv
 source .venv/bin/activate
 uv sync
@@ -109,10 +111,37 @@ CHATTERBOX_GPU_MEMORY_UTILIZATION=0.5 \
 python tts_api_server.py
 ```
 
+Or use the repo-local launcher, which is friendlier for non-interactive startup:
+
+```bash
+cp chatterbox-server.env.example chatterbox-server.env
+./easy_start.sh
+```
+
 The server exposes:
 * `GET /healthz`
 * `GET /v1/languages`
 * `POST /v1/tts` (multipart form; returns WAV audio)
+
+## Start On Boot With systemd
+
+This repo now includes:
+* `easy_start.sh` for boot-safe startup
+* `chatterbox-server.env.example` for editable server settings
+* `chatterbox-fastest.service` for Linux `systemd`
+
+Typical setup:
+
+```bash
+cp /chatterbox-fastest/chatterbox-server.env.example /chatterbox-fastest/chatterbox-server.env
+chmod +x /chatterbox-fastest/easy_start.sh
+sudo cp /chatterbox-fastest/chatterbox-fastest.service /etc/systemd/system/chatterbox-fastest.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now chatterbox-fastest.service
+sudo systemctl status chatterbox-fastest.service
+```
+
+If your repo is not located at `/chatterbox-fastest`, update the paths in `chatterbox-fastest.service` before enabling it.
 
 Example request with voice cloning:
 ```bash

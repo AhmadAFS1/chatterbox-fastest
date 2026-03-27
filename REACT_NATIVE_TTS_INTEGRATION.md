@@ -61,10 +61,8 @@ Examples:
 Example:
 
 ```bash
-source .venv/bin/activate
-CHATTERBOX_MODEL_VARIANT=multilingual \
-CHATTERBOX_GPU_MEMORY_UTILIZATION=0.3 \
-python tts_api_server.py
+cp chatterbox-server.env.example chatterbox-server.env
+./easy_start.sh
 ```
 
 Default server bind:

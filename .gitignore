@@ -29,6 +29,7 @@ htmlcov/
 *.env
 *.secrets
 /local.properties
+/chatterbox-server.env
 
 # Test files
 *.mp3
