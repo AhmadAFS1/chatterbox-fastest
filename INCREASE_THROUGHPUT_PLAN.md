@@ -12,33 +12,85 @@ This plan is based on a full pass through the repo, especially:
 - `load_test_tts.sh`
 - `README.md`
 
+Historical note: sections below describe the original bottlenecks found before the first implementation pass. The current state now includes API micro-batching, stage timing headers, safe inference-time weight norm removal, and WAV validation in the load test.
+
 ## Executive Summary
 
-The current bottlenecks are a mix of real model cost and server-side serialization:
+The original bottlenecks were a mix of real model cost and server-side serialization. After the first implementation pass, the biggest remaining issues are different:
 
-1. The API currently serializes all generation behind a global lock.
-2. T3 uses batching through vLLM, but `S3Gen` still runs one output at a time.
-3. The load test currently blends queue time and generation time, which makes tuning harder.
-4. The HiFiGAN and F0 predictor path still has obvious inference-time overheads.
-5. Server defaults are currently over-reserving memory for T3 on low-VRAM GPUs.
+1. Compatible requests now batch together, but a late arrival still waits for the current GPU batch to finish.
+2. T3 uses batching through vLLM, but `S3Gen` still does not batch internally.
+3. The load test now separates queue time and generation time and validates returned WAV bodies.
+4. HiFiGAN and the F0 predictor now remove weight norm safely at inference, so the easiest low-risk overhead reduction is already in place.
+5. Server defaults still need empirical tuning on 12 GB GPUs because vLLM reservation interacts with the rest of the pipeline.
 
 For long-form generation, the repo's own benchmark already shows that `S3Gen` dominates wall time. For short API requests, T3 is still a noticeable slice, but queueing becomes the biggest issue once concurrency rises.
 
+## Findings As Of 2026-03-28
+
+The first pass is implemented and measured.
+
+What is now true:
+
+* The old full-request `generation_lock` bottleneck is gone. The API batches compatible concurrent requests together before generation starts.
+* `load_test_tts.sh` now validates that each response is a real WAV and that decoded duration matches `X-Audio-Seconds`.
+* Batch timing is now broken out into queue wait, conditioning, T3, S3Gen, WAV encode, and end-to-end headers.
+
+Key benchmark findings on an RTX 3080 Ti 12 GB:
+
+* `10` total / `10` concurrent multilingual requests now batch correctly into one batch, with `valid_wavs=10/10`.
+* `CHATTERBOX_S3GEN_USE_FP16=true` was slower than `false` in the tested multilingual runs.
+* Lowering `diffusion_steps` remains the biggest request-level speed lever.
+* Real React Native app traffic with batch size `1` and varying text lengths was already comfortably realtime on the same RTX 3080 Ti, with observed realtime factors from `1.33x` to `1.85x`.
+
+Single-process burst results with `diffusion_steps=3`:
+
+| Setting | avg_generation | avg_t3 | avg_s3gen | throughput |
+| --- | ---: | ---: | ---: | ---: |
+| `gpu_memory_utilization=0.25` | `4.971s` | `1.606s` | `3.365s` | `1.434 req/s` |
+| `gpu_memory_utilization=0.50` | `5.197s` | `2.107s` | `3.090s` | `1.365 req/s` |
+
+Staggered-arrival findings:
+
+* A request sent `1.0s` after another request did not join the in-flight batch. It waited for the current batch to finish.
+* At `gpu_memory_utilization=0.25`, that second request saw about `0.42s` queue wait.
+* At `gpu_memory_utilization=0.50`, that second request saw about `0.82s` queue wait.
+* With a `3.0s` gap, both settings behaved like independent single-request runs with queue wait around `0.01s`.
+
+Multi-worker findings:
+
+* Two independent model processes on the same 12 GB GPU were viable at `gpu_memory_utilization=0.25` each.
+* In a round-robin `10`-request test across two `0.25` servers, combined throughput reached about `2.49 req/s`.
+* Each process only batched about `5` requests on average, so this trades some batch efficiency for lower queueing and parallel model copies.
+* This makes separate worker processes behind a reverse proxy a promising deployment option for short-request burst traffic.
+* It is not the same as blindly raising `uvicorn workers`, because each worker duplicates the full model stack and needs explicit VRAM budgeting.
+
+Observed real app traces on the same RTX 3080 Ti:
+
+| Pattern | avg_audio | avg_generation | avg_t3 | avg_s3gen | avg_rtf |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| React Native single-request traffic | `4.208s` | `2.510s` | `2.022s` | `0.488s` | `1.658x` |
+
+Interpretation:
+
+* The repo is already good enough for realtime full-audio responses for single-user or lightly staggered app traffic on an RTX 3080 Ti.
+* The main remaining gap is burst handling, not one-request latency.
+
 ## Current Bottlenecks
 
-### 1. API request serialization
+### 1. Single-GPU batch scheduling
 
-The biggest end-to-end throughput limiter is not raw S3Gen math. It is the server-level lock in `tts_api_server.py`.
+The old server-level serialization has been replaced by a request queue plus micro-batching. The remaining scheduling limitation is that one GPU batch still runs at a time.
 
-- `generation_lock` is defined in `tts_api_server.py`
-- Every request waits on `with generation_lock:`
-- Uvicorn also runs with `workers=1`
+- Compatible pending requests can batch together before generation starts.
+- Requests that arrive after a batch has already started wait for the next batch.
+- The server still runs one model process per port by default.
 
 Impact:
 
-- Concurrent requests are accepted, but only one generation runs at a time.
-- Later requests spend most of their time waiting in line.
-- This is why API realtime factor degrades sharply under concurrent load.
+- Concurrent requests no longer serialize one-by-one.
+- Near-simultaneous arrivals benefit from batching.
+- Staggered arrivals still queue behind the in-flight batch.
 
 Quality impact of fixing this: none.
 
@@ -68,17 +120,19 @@ Impact:
 
 Quality impact of fixing this: none if batching is implemented correctly.
 
-### 3. Load-test timing is misleading under concurrency
+### 3. Observability is fixed; keep using it
 
-The API timer starts before the generation lock is acquired, and the load test treats the returned header as model time.
+This item is no longer a blocker. The API now returns separate timing headers, and the load test validates the returned WAV body.
 
-Impact:
+Keep relying on:
 
-- `avg_model_gen` from `load_test_tts.sh` is not pure model time.
-- It includes queue wait under concurrent load.
-- This makes it harder to know whether a change improved actual inference or just reduced queueing.
+- `avg_queue_wait`
+- `avg_t3`
+- `avg_s3gen`
+- `valid_wavs`
+- `duration_mismatches`
 
-Quality impact of fixing this: none.
+These now make A/B tuning decisions much safer.
 
 ### 4. HiFiGAN / vocoder path still carries inference overhead
 
@@ -88,7 +142,7 @@ In `src/chatterbox_vllm/models/s3gen/hifigan.py`:
 - STFT and ISTFT are performed in the decode path.
 - The source-generation path does extra tensor creation and transforms.
 
-There is a `remove_weight_norm()` helper, but it is not currently used in inference and is not fully wired correctly yet.
+Inference-time weight norm removal is now wired in safely after load, but the vocoder path is still a major share of the remaining `S3Gen` time.
 
 Impact:
 
@@ -97,15 +151,11 @@ Impact:
 
 Quality impact of fixing this: expected to be none if done correctly after load.
 
-### 5. F0 predictor is also weight-norm heavy
+### 5. F0 predictor still contributes to S3Gen cost
 
 In `src/chatterbox_vllm/models/s3gen/f0_predictor.py`, the F0 predictor uses stacked weight-normalized convolutions.
 
-Impact:
-
-- Adds inference-time overhead on every S3Gen pass.
-
-Quality impact of fixing this: expected none if weight norm is removed only for inference after weights are loaded.
+Weight norm removal is now applied safely for inference. The remaining concern is total S3Gen compute cost, not the old missing optimization.
 
 ### 6. Diffusion cost scales directly with step count
 

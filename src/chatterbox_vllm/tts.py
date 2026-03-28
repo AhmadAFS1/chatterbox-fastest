@@ -58,6 +58,14 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
+@dataclass
+class BatchGenerationRequest:
+    prompts: list[str]
+    s3gen_ref: dict[str, Any]
+    cond_emb: torch.Tensor
+    language_id: str = "en"
+
+
 class ChatterboxTTS:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
@@ -152,6 +160,7 @@ class ChatterboxTTS:
         s3gen = S3Gen(use_fp16=False)
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
+        s3gen.remove_weight_norm()
 
         default_conds = Conditionals.load(ckpt_dir / "conds.pt")
         default_conds.to(device=target_device)
@@ -247,6 +256,145 @@ class ChatterboxTTS:
         ).to('cpu')
         return new_cond_emb
 
+    def _normalize_prompt(self, prompt: str, language_id: str) -> str:
+        prompt = "[START]" + punc_norm(prompt) + "[STOP]"
+        if self.variant == "multilingual":
+            prompt = f"<{language_id.lower()}>{prompt}"
+        return prompt
+
+    def _build_sampling_params(
+        self,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        min_p: float,
+        repetition_penalty: float,
+        *args,
+        **kwargs,
+    ) -> SamplingParams:
+        try:
+            return SamplingParams(
+                temperature=temperature,
+                stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                max_tokens=min(max_tokens, self.max_model_len),
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                *args, **kwargs,
+            )
+        except TypeError as e:
+            # `min_p` support depends on vLLM version; fall back if unsupported.
+            if "min_p" not in str(e):
+                raise
+            return SamplingParams(
+                temperature=temperature,
+                stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                max_tokens=min(max_tokens, self.max_model_len),
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                *args, **kwargs,
+            )
+
+    def _generate_flat_with_conds(
+        self,
+        prompts: list[str],
+        cond_embs: list[torch.Tensor],
+        s3gen_refs: list[dict[str, Any]],
+        language_ids: list[str],
+        temperature: float,
+        max_tokens: int,
+        diffusion_steps: int,
+        top_p: float,
+        min_p: float,
+        repetition_penalty: float,
+        clear_cuda_cache: bool,
+        s3gen_oom_retries: int,
+        *args,
+        **kwargs,
+    ) -> tuple[list[torch.Tensor], dict[str, float]]:
+        normalized_prompts = [
+            self._normalize_prompt(prompt, language_id)
+            for prompt, language_id in zip(prompts, language_ids)
+        ]
+
+        with torch.inference_mode():
+            start_time = time.time()
+            sampling_params = self._build_sampling_params(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                *args,
+                **kwargs,
+            )
+
+            batch_results = self.t3.generate(
+                [
+                    {
+                        "prompt": text,
+                        "multi_modal_data": {
+                            "conditionals": [cond_emb],
+                        },
+                    }
+                    for text, cond_emb in zip(normalized_prompts, cond_embs)
+                ],
+                sampling_params=sampling_params,
+            )
+            t3_gen_time = time.time() - start_time
+            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+
+            if clear_cuda_cache:
+                torch.cuda.empty_cache()
+
+            start_time = time.time()
+            results: list[torch.Tensor] = []
+            for i, (batch_result, s3gen_ref) in enumerate(zip(batch_results, s3gen_refs)):
+                for output in batch_result.outputs:
+                    if i % 5 == 0:
+                        print(f"[S3] Processing prompt {i} of {len(batch_results)}")
+
+                    # Periodic cache clears help on low-VRAM cards, but they add sync overhead.
+                    if clear_cuda_cache and i % 10 == 0:
+                        torch.cuda.empty_cache()
+
+                    speech_tokens = torch.tensor(output.token_ids, device=self.target_device, dtype=torch.long)
+                    speech_tokens = speech_tokens - SPEECH_TOKEN_OFFSET
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    # Retry once on CUDA OOM; avoids paying `empty_cache()` sync cost on every call.
+                    for attempt in range(max(0, s3gen_oom_retries) + 1):
+                        try:
+                            autocast_ctx = (
+                                torch.autocast(device_type="cuda", dtype=torch.float16)
+                                if self.s3gen_mixed_precision and torch.cuda.is_available()
+                                else nullcontext()
+                            )
+                            with autocast_ctx:
+                                wav, _ = self.s3gen.inference(
+                                    speech_tokens=speech_tokens,
+                                    ref_dict=s3gen_ref,
+                                    n_timesteps=diffusion_steps,
+                                )
+                            break
+                        except RuntimeError as e:
+                            is_oom = "out of memory" in str(e).lower()
+                            if attempt < s3gen_oom_retries and is_oom and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                continue
+                            raise
+                    results.append(wav.float().cpu())
+
+            s3gen_gen_time = time.time() - start_time
+            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+
+            return results, {
+                "t3_seconds": t3_gen_time,
+                "s3gen_seconds": s3gen_gen_time,
+                "prompt_count": float(len(normalized_prompts)),
+            }
+
     def generate(
         self,
         prompts: Union[str, list[str]],
@@ -319,100 +467,91 @@ class ChatterboxTTS:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
-        # Norm and tokenize text
-        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+        results, _ = self._generate_flat_with_conds(
+            prompts=prompts,
+            cond_embs=[cond_emb for _ in prompts],
+            s3gen_refs=[s3gen_ref for _ in prompts],
+            language_ids=[language_id.lower() for _ in prompts],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            diffusion_steps=diffusion_steps,
+            top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            clear_cuda_cache=clear_cuda_cache,
+            s3gen_oom_retries=s3gen_oom_retries,
+            *args,
+            **kwargs,
+        )
+        return results
 
-        # For multilingual, prepend the language token
-        if self.variant == "multilingual":
-            # Use angle brackets to avoid conflicts with other start/stop tokens.
-            # This will be parsed and replaced in the tokenizer.
-            prompts = [f"<{language_id.lower()}>{p}" for p in prompts]
+    def generate_batched_with_conds(
+        self,
+        requests: list[BatchGenerationRequest],
+        temperature: float = 0.8,
+        max_tokens: int = 1000,
+        diffusion_steps: int = 10,
+        top_p: float = 1.0,
+        min_p: float = 0.05,
+        repetition_penalty: float = 2.0,
+        *args,
+        **kwargs,
+    ) -> tuple[list[list[torch.Tensor]], dict[str, float]]:
+        clear_cuda_cache = bool(kwargs.pop("clear_cuda_cache", True))
+        s3gen_oom_retries = int(kwargs.pop("s3gen_oom_retries", 1))
 
-        with torch.inference_mode():
-            start_time = time.time()
-            try:
-                sampling_params = SamplingParams(
-                    temperature=temperature,
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                    max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
-                    min_p=min_p,
-                    repetition_penalty=repetition_penalty,
-                    *args, **kwargs,
+        if not requests:
+            return [], {
+                "t3_seconds": 0.0,
+                "s3gen_seconds": 0.0,
+                "prompt_count": 0.0,
+                "request_count": 0.0,
+            }
+
+        flat_prompts: list[str] = []
+        flat_cond_embs: list[torch.Tensor] = []
+        flat_refs: list[dict[str, Any]] = []
+        flat_languages: list[str] = []
+        flat_to_request: list[int] = []
+
+        for request_idx, request in enumerate(requests):
+            if request.language_id.lower() not in self.get_supported_languages():
+                supported_langs = ", ".join(self.get_supported_languages().keys())
+                raise ValueError(
+                    f"Unsupported language_id '{request.language_id}'. "
+                    f"Supported languages: {supported_langs}"
                 )
-            except TypeError as e:
-                # `min_p` support depends on vLLM version; fall back if unsupported.
-                if "min_p" not in str(e):
-                    raise
-                sampling_params = SamplingParams(
-                    temperature=temperature,
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                    max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    *args, **kwargs,
-                )
 
-            batch_results = self.t3.generate(
-                [
-                    {
-                        "prompt": text,
-                        "multi_modal_data": {
-                            "conditionals": [cond_emb],
-                        },
-                    }
-                    for text in prompts
-                ],
-                sampling_params=sampling_params,
-            )
-            t3_gen_time = time.time() - start_time
-            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+            for prompt in request.prompts:
+                flat_prompts.append(prompt)
+                flat_cond_embs.append(request.cond_emb)
+                flat_refs.append(request.s3gen_ref)
+                flat_languages.append(request.language_id.lower())
+                flat_to_request.append(request_idx)
 
-            if clear_cuda_cache:
-                torch.cuda.empty_cache()
+        flat_results, timings = self._generate_flat_with_conds(
+            prompts=flat_prompts,
+            cond_embs=flat_cond_embs,
+            s3gen_refs=flat_refs,
+            language_ids=flat_languages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            diffusion_steps=diffusion_steps,
+            top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            clear_cuda_cache=clear_cuda_cache,
+            s3gen_oom_retries=s3gen_oom_retries,
+            *args,
+            **kwargs,
+        )
 
-            start_time = time.time()
-            results = []
-            for i, batch_result in enumerate(batch_results):
-                for output in batch_result.outputs:
-                    if i % 5 == 0:
-                        print(f"[S3] Processing prompt {i} of {len(batch_results)}")
+        grouped_results: list[list[torch.Tensor]] = [[] for _ in requests]
+        for request_idx, wav in zip(flat_to_request, flat_results):
+            grouped_results[request_idx].append(wav)
 
-                    # Periodic cache clears help on low-VRAM cards, but they add sync overhead.
-                    if clear_cuda_cache and i % 10 == 0:
-                        torch.cuda.empty_cache()
-
-                    speech_tokens = torch.tensor(output.token_ids, device=self.target_device, dtype=torch.long)
-                    speech_tokens = speech_tokens - SPEECH_TOKEN_OFFSET
-                    speech_tokens = drop_invalid_tokens(speech_tokens)
-                    speech_tokens = speech_tokens[speech_tokens < 6561]
-
-                    # Retry once on CUDA OOM; avoids paying `empty_cache()` sync cost on every call.
-                    for attempt in range(max(0, s3gen_oom_retries) + 1):
-                        try:
-                            autocast_ctx = (
-                                torch.autocast(device_type="cuda", dtype=torch.float16)
-                                if self.s3gen_mixed_precision and torch.cuda.is_available()
-                                else nullcontext()
-                            )
-                            with autocast_ctx:
-                                wav, _ = self.s3gen.inference(
-                                    speech_tokens=speech_tokens,
-                                    ref_dict=s3gen_ref,
-                                    n_timesteps=diffusion_steps,
-                                )
-                            break
-                        except RuntimeError as e:
-                            is_oom = "out of memory" in str(e).lower()
-                            if attempt < s3gen_oom_retries and is_oom and torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                                continue
-                            raise
-                    results.append(wav.float().cpu())
-            s3gen_gen_time = time.time() - start_time
-            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
-
-            return results
+        timings["request_count"] = float(len(requests))
+        return grouped_results, timings
         
     def shutdown(self):
         del self.t3

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -19,7 +20,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from chatterbox_vllm.text_utils import SUPPORTED_LANGUAGES
-from chatterbox_vllm.tts import ChatterboxTTS
+from chatterbox_vllm.tts import BatchGenerationRequest, ChatterboxTTS
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -72,6 +73,9 @@ ENABLE_SPLIT_SENTENCES_DEFAULT = _env_bool("CHATTERBOX_SPLIT_SENTENCES_DEFAULT",
 COMPILE = _env_bool("CHATTERBOX_COMPILE", False)
 CONDS_CACHE_SIZE = _env_int("CHATTERBOX_CONDS_CACHE_SIZE", 32)
 S3GEN_USE_FP16 = _env_bool("CHATTERBOX_S3GEN_USE_FP16", False)
+API_BATCH_COLLECT_SECONDS = _env_float("CHATTERBOX_API_BATCH_COLLECT_MS", 10.0) / 1000.0
+API_MAX_BATCH_REQUESTS = _env_int("CHATTERBOX_API_MAX_BATCH_REQUESTS", MAX_BATCH_SIZE)
+API_MAX_BATCH_PROMPTS = _env_int("CHATTERBOX_API_MAX_BATCH_PROMPTS", MAX_BATCH_SIZE)
 
 if MODEL_VARIANT not in {"english", "multilingual"}:
     raise ValueError("CHATTERBOX_MODEL_VARIANT must be either 'english' or 'multilingual'.")
@@ -83,7 +87,176 @@ app = FastAPI(title="Chatterbox TTS API", version="0.1.0")
 global_model: Optional[ChatterboxTTS] = None
 cond_cache: OrderedDict[str, tuple[dict[str, Any], torch.Tensor]] = OrderedDict()
 cond_cache_lock = threading.Lock()
-generation_lock = threading.Lock()
+generation_batcher: Optional["GenerationBatcher"] = None
+
+
+@dataclass(frozen=True)
+class GenerationConfig:
+    temperature: float
+    diffusion_steps: int
+    min_p: float
+    top_p: float
+    repetition_penalty: float
+    seed: Optional[int]
+
+
+@dataclass
+class PendingGeneration:
+    prompts: list[str]
+    s3gen_ref: dict[str, Any]
+    cond_emb: torch.Tensor
+    language_id: str
+    config: GenerationConfig
+    received_at: float
+    conditioning_seconds: float
+    enqueued_at: float = field(default_factory=time.perf_counter)
+    done: threading.Event = field(default_factory=threading.Event)
+    wavs: Optional[list[torch.Tensor]] = None
+    timings: dict[str, float] = field(default_factory=dict)
+    error: Optional[Exception] = None
+
+    @property
+    def prompt_count(self) -> int:
+        return max(1, len(self.prompts))
+
+
+class GenerationBatcher:
+    def __init__(
+        self,
+        collect_seconds: float,
+        max_batch_requests: int,
+        max_batch_prompts: int,
+    ):
+        self.collect_seconds = max(0.0, collect_seconds)
+        self.max_batch_requests = max(1, max_batch_requests)
+        self.max_batch_prompts = max(1, max_batch_prompts)
+        self._pending: list[PendingGeneration] = []
+        self._cv = threading.Condition()
+        self._closed = False
+        self._worker = threading.Thread(target=self._run, name="tts-generation-batcher", daemon=True)
+        self._worker.start()
+
+    def submit(self, job: PendingGeneration) -> list[torch.Tensor]:
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("Generation batcher is closed.")
+            self._pending.append(job)
+            self._cv.notify()
+
+        job.done.wait()
+        if job.error is not None:
+            raise job.error
+        return job.wavs or []
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._worker.join(timeout=5)
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._pending and not self._closed:
+                    self._cv.wait()
+
+                if self._closed and not self._pending:
+                    return
+
+                batch_deadline = time.perf_counter() + self.collect_seconds
+                while not self._closed:
+                    if len(self._pending) >= self.max_batch_requests:
+                        break
+                    remaining = batch_deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    self._cv.wait(timeout=remaining)
+
+                jobs = self._take_next_batch_locked()
+
+            self._process_batch(jobs)
+
+    def _take_next_batch_locked(self) -> list[PendingGeneration]:
+        anchor = self._pending[0]
+        selected: list[PendingGeneration] = []
+        selected_indices: list[int] = []
+        total_prompts = 0
+
+        for idx, job in enumerate(self._pending):
+            if job.config != anchor.config:
+                continue
+
+            prompt_count = job.prompt_count
+            if selected and (
+                len(selected) >= self.max_batch_requests
+                or total_prompts + prompt_count > self.max_batch_prompts
+            ):
+                continue
+
+            selected.append(job)
+            selected_indices.append(idx)
+            total_prompts += prompt_count
+
+            if len(selected) >= self.max_batch_requests or total_prompts >= self.max_batch_prompts:
+                break
+
+        if not selected:
+            return [self._pending.pop(0)]
+
+        for idx in reversed(selected_indices):
+            self._pending.pop(idx)
+        return selected
+
+    def _process_batch(self, jobs: list[PendingGeneration]) -> None:
+        model = load_model()
+        batch_started_at = time.perf_counter()
+        config = jobs[0].config
+
+        if config.seed is not None:
+            set_seed(config.seed)
+
+        try:
+            batched_requests = [
+                BatchGenerationRequest(
+                    prompts=job.prompts,
+                    s3gen_ref=job.s3gen_ref,
+                    cond_emb=job.cond_emb,
+                    language_id=job.language_id,
+                )
+                for job in jobs
+            ]
+            wav_batches, stage_timings = model.generate_batched_with_conds(
+                batched_requests,
+                temperature=config.temperature,
+                diffusion_steps=config.diffusion_steps,
+                min_p=config.min_p,
+                top_p=config.top_p,
+                repetition_penalty=config.repetition_penalty,
+                seed=config.seed,
+                clear_cuda_cache=False,
+            )
+            finished_at = time.perf_counter()
+        except Exception as exc:
+            for job in jobs:
+                job.error = exc
+                job.done.set()
+            return
+
+        generation_seconds = finished_at - batch_started_at
+        batch_request_count = float(len(jobs))
+        batch_prompt_count = float(sum(job.prompt_count for job in jobs))
+
+        for job, wavs in zip(jobs, wav_batches):
+            job.wavs = wavs
+            job.timings = {
+                "queue_wait_seconds": batch_started_at - job.enqueued_at,
+                "generation_seconds": generation_seconds,
+                "t3_seconds": stage_timings["t3_seconds"],
+                "s3gen_seconds": stage_timings["s3gen_seconds"],
+                "batch_requests": batch_request_count,
+                "batch_prompts": batch_prompt_count,
+            }
+            job.done.set()
 
 
 def load_model() -> ChatterboxTTS:
@@ -114,9 +287,29 @@ def load_model() -> ChatterboxTTS:
     return global_model
 
 
+def _get_generation_batcher() -> GenerationBatcher:
+    global generation_batcher
+    if generation_batcher is None:
+        generation_batcher = GenerationBatcher(
+            collect_seconds=API_BATCH_COLLECT_SECONDS,
+            max_batch_requests=API_MAX_BATCH_REQUESTS,
+            max_batch_prompts=API_MAX_BATCH_PROMPTS,
+        )
+    return generation_batcher
+
+
 @app.on_event("startup")
 def _startup() -> None:
     load_model()
+    _get_generation_batcher()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    global generation_batcher
+    if generation_batcher is not None:
+        generation_batcher.close()
+        generation_batcher = None
 
 
 def _get_conds_from_uploaded_audio(audio_bytes: bytes, filename: Optional[str]) -> tuple[dict[str, Any], torch.Tensor]:
@@ -197,6 +390,7 @@ def tts(
     seed: int = Form(0),
 ) -> StreamingResponse:
     model = load_model()
+    request_started_at = time.perf_counter()
 
     if not text.strip():
         raise HTTPException(status_code=400, detail="`text` must not be empty.")
@@ -206,49 +400,70 @@ def tts(
     elif language_id.lower() not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail=f"Unsupported `language_id`: {language_id}")
 
-    if seed != 0:
-        seed_value = set_seed(int(seed))
-    else:
-        seed_value = None
+    seed_value = int(seed) if seed != 0 else None
 
+    conds_started_at = time.perf_counter()
     s3gen_ref, cond_emb = _get_conds(audio_prompt)
     cond_emb = model.update_exaggeration(cond_emb, exaggeration=exaggeration)
+    conditioning_seconds = time.perf_counter() - conds_started_at
     prompts = maybe_split_text(text, split_sentences=split_sentences)
 
-    t0 = time.perf_counter()
-    with generation_lock:
-        wavs = model.generate_with_conds(
-            prompts,
-            s3gen_ref=s3gen_ref,
-            cond_emb=cond_emb,
-            language_id=language_id.lower(),
+    job = PendingGeneration(
+        prompts=prompts,
+        s3gen_ref=s3gen_ref,
+        cond_emb=cond_emb,
+        language_id=language_id.lower(),
+        config=GenerationConfig(
             temperature=temperature,
             diffusion_steps=diffusion_steps,
             min_p=min_p,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             seed=seed_value,
-            clear_cuda_cache=False,
-        )
-
-    combined = torch.cat([w.squeeze(0) for w in wavs], dim=-1)
-    elapsed = time.perf_counter() - t0
-    audio_seconds = combined.shape[-1] / model.sr
-    print(
-        f"[API] Generated {audio_seconds:.2f}s audio in {elapsed:.2f}s "
-        f"({audio_seconds / elapsed:.2f}x realtime), chunks={len(prompts)}"
+        ),
+        received_at=request_started_at,
+        conditioning_seconds=conditioning_seconds,
     )
+    wavs = _get_generation_batcher().submit(job)
 
+    wav_encode_started_at = time.perf_counter()
+    combined = torch.cat([w.squeeze(0) for w in wavs], dim=-1)
     waveform = combined.unsqueeze(0).cpu()
     buffer = io.BytesIO()
     ta.save(buffer, waveform, model.sr, format="wav")
     buffer.seek(0)
+    wav_encode_seconds = time.perf_counter() - wav_encode_started_at
+
+    generation_seconds = job.timings["generation_seconds"]
+    queue_wait_seconds = job.timings["queue_wait_seconds"]
+    t3_seconds = job.timings["t3_seconds"]
+    s3gen_seconds = job.timings["s3gen_seconds"]
+    batch_requests = int(job.timings["batch_requests"])
+    batch_prompts = int(job.timings["batch_prompts"])
+    audio_seconds = combined.shape[-1] / model.sr
+    end_to_end_seconds = time.perf_counter() - request_started_at
+
+    print(
+        f"[API] batch_requests={batch_requests} batch_prompts={batch_prompts} "
+        f"queue={queue_wait_seconds:.2f}s conds={conditioning_seconds:.2f}s "
+        f"t3={t3_seconds:.2f}s s3gen={s3gen_seconds:.2f}s wav={wav_encode_seconds:.2f}s "
+        f"audio={audio_seconds:.2f}s gen={generation_seconds:.2f}s "
+        f"rtf={audio_seconds / generation_seconds:.2f}x chunks={len(prompts)}"
+    )
 
     headers = {
-        "X-Generation-Seconds": f"{elapsed:.4f}",
+        "X-Conditioning-Seconds": f"{conditioning_seconds:.4f}",
+        "X-Queue-Wait-Seconds": f"{queue_wait_seconds:.4f}",
+        "X-Generation-Seconds": f"{generation_seconds:.4f}",
+        "X-T3-Seconds": f"{t3_seconds:.4f}",
+        "X-S3Gen-Seconds": f"{s3gen_seconds:.4f}",
+        "X-Wav-Encode-Seconds": f"{wav_encode_seconds:.4f}",
+        "X-End-To-End-Seconds": f"{end_to_end_seconds:.4f}",
         "X-Audio-Seconds": f"{audio_seconds:.4f}",
-        "X-Realtime-Factor": f"{(audio_seconds / elapsed):.4f}",
+        "X-Realtime-Factor": f"{(audio_seconds / generation_seconds):.4f}",
         "X-Chunks": str(len(prompts)),
+        "X-Batch-Requests": str(batch_requests),
+        "X-Batch-Prompts": str(batch_prompts),
     }
     return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
 

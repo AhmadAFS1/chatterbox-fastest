@@ -24,8 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Conv1d
 from torch.nn import ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 from torch.distributions.uniform import Uniform
 from torch import nn, sin, pow
 from torch.nn import Parameter
@@ -92,6 +92,14 @@ def init_weights(m, mean=0.0, std=0.01):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         m.weight.data.normal_(mean, std)
+
+
+def _remove_parametrized_weight_norm(module: nn.Module) -> bool:
+    parametrizations = getattr(module, "parametrizations", None)
+    if parametrizations is None or not hasattr(parametrizations, "weight"):
+        return False
+    remove_parametrizations(module, "weight", leave_parametrized=True)
+    return True
 
 
 """hifigan based generator implementation.
@@ -162,8 +170,8 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            _remove_parametrized_weight_norm(self.convs1[idx])
+            _remove_parametrized_weight_norm(self.convs2[idx])
 
 
 class SineGen(torch.nn.Module):
@@ -292,6 +300,11 @@ class SourceModuleHnNSF(torch.nn.Module):
         noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
 
+    def remove_weight_norm(self):
+        # This module does not currently apply weight norm, but the vocoder
+        # teardown path calls into it during inference-only optimization.
+        return None
+
 
 class HiFTGenerator(nn.Module):
     """
@@ -392,14 +405,14 @@ class HiFTGenerator(nn.Module):
     def remove_weight_norm(self):
         print('Removing weight norm...')
         for l in self.ups:
-            remove_weight_norm(l)
+            _remove_parametrized_weight_norm(l)
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+        _remove_parametrized_weight_norm(self.conv_pre)
+        _remove_parametrized_weight_norm(self.conv_post)
         self.m_source.remove_weight_norm()
         for l in self.source_downs:
-            remove_weight_norm(l)
+            _remove_parametrized_weight_norm(l)
         for l in self.source_resblocks:
             l.remove_weight_norm()
 

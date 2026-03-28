@@ -118,6 +118,8 @@ cp chatterbox-server.env.example chatterbox-server.env
 ./easy_start.sh
 ```
 
+`easy_start.sh` now automatically loads `chatterbox-server.env` if it exists.
+
 The server exposes:
 * `GET /healthz`
 * `GET /v1/languages`
@@ -142,6 +144,40 @@ sudo systemctl status chatterbox-fastest.service
 ```
 
 If your repo is not located at `/chatterbox-fastest`, update the paths in `chatterbox-fastest.service` before enabling it.
+
+Useful server knobs for throughput tuning:
+* `CHATTERBOX_MAX_MODEL_LEN`
+* `CHATTERBOX_GPU_MEMORY_UTILIZATION`
+* `CHATTERBOX_API_BATCH_COLLECT_MS`
+* `CHATTERBOX_API_MAX_BATCH_REQUESTS`
+* `CHATTERBOX_API_MAX_BATCH_PROMPTS`
+
+### Current Tuning Notes
+
+Validated on March 28, 2026 on an RTX 3080 Ti 12 GB using short multilingual requests and `./load_test_tts.sh`.
+
+Single-process results with `diffusion_steps=3` and `10` total / `10` concurrent requests:
+
+| Setting | avg_generation | avg_t3 | avg_s3gen | throughput | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `gpu_memory_utilization=0.25` | `4.971s` | `1.606s` | `3.365s` | `1.434 req/s` | Best single-process burst result in this test. |
+| `gpu_memory_utilization=0.50` | `5.197s` | `2.107s` | `3.090s` | `1.365 req/s` | Slightly slower here, but still a safe default. |
+
+Other validated findings:
+
+* `CHATTERBOX_S3GEN_USE_FP16=false` outperformed `true` in the tested multilingual runs on this GPU.
+* `diffusion_steps=3` is the most reliable request-level speed knob. It materially reduces `S3Gen` time, with an expected quality tradeoff.
+* A request that arrives while a batch is already running does not join that in-flight batch. In staggered tests, a second request sent `1.0s` later waited about `0.42s` at `gpu_memory_utilization=0.25` and about `0.82s` at `0.50`.
+* A request sent a few seconds later usually starts immediately. In staggered tests with a `3.0s` gap, queue wait stayed around `0.01s`.
+* If you want multiple model workers on a single 12 GB GPU, the promising pattern is separate server processes behind a reverse proxy or load balancer, not `uvicorn workers=2` on one port. In one test, two independent `0.25` servers reached about `2.49 req/s` combined throughput with `avg_batch_requests=5`, compared with about `1.43 req/s` for one `0.25` server handling the same `10` concurrent requests.
+* The two-process approach duplicates the full model stack in VRAM and reduces per-process batching, so it is best suited to short request workloads where lower queue time matters more than maximum batch size.
+
+Real app traces from a React Native client on the same RTX 3080 Ti showed stronger single-request behavior than the burst tests:
+
+* `5` observed single-request calls with varying text lengths returned `3.00s` to `5.76s` of audio in `1.81s` to `3.11s` of generation time.
+* Observed realtime factor ranged from `1.33x` to `1.85x`, with an average of about `1.66x`.
+* Average stage timings across those app-driven requests were about `2.02s` in `T3` and `0.49s` in `S3Gen`, confirming that short single-request traffic is already realtime on an RTX 3080 Ti.
+* The first request paid about `0.29s` of conditioning time, while later requests in the sample stayed at `0.00s`, which is consistent with default or already-prepared conditionals.
 
 Example request with voice cloning:
 ```bash

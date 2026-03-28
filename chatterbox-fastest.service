@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/chatterbox-fastest
+EnvironmentFile=-/chatterbox-fastest/chatterbox-server.env
 ExecStart=/chatterbox-fastest/easy_start.sh
 Restart=on-failure
 RestartSec=10

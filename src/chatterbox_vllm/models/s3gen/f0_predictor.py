@@ -14,6 +14,7 @@
 import torch
 import torch.nn as nn
 from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 
 
 class ConvRNNF0Predictor(nn.Module):
@@ -53,3 +54,9 @@ class ConvRNNF0Predictor(nn.Module):
         x = self.condnet(x)
         x = x.transpose(1, 2)
         return torch.abs(self.classifier(x).squeeze(-1))
+
+    def remove_weight_norm(self):
+        for layer in self.condnet:
+            parametrizations = getattr(layer, "parametrizations", None)
+            if parametrizations is not None and hasattr(parametrizations, "weight"):
+                remove_parametrizations(layer, "weight", leave_parametrized=True)

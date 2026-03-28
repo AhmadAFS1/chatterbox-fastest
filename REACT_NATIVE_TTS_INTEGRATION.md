@@ -29,10 +29,43 @@ Response details:
 - body: binary WAV file data
 
 Response headers:
+- `X-Conditioning-Seconds`: reference-audio conditioning time
+- `X-Queue-Wait-Seconds`: time spent waiting to be included in a generation batch
 - `X-Generation-Seconds`: model generation time in seconds
+- `X-T3-Seconds`: time spent generating speech tokens
+- `X-S3Gen-Seconds`: time spent converting speech tokens into waveform audio
+- `X-Wav-Encode-Seconds`: WAV serialization time
+- `X-End-To-End-Seconds`: total server-side request time
 - `X-Audio-Seconds`: output audio duration in seconds
 - `X-Realtime-Factor`: generated-audio-seconds divided by generation-seconds
 - `X-Chunks`: number of prompt chunks used internally
+- `X-Batch-Requests`: number of HTTP requests merged into the same generation batch
+- `X-Batch-Prompts`: number of prompt chunks merged into the same generation batch
+
+## Observed App Performance On RTX 3080 Ti
+
+Real requests from a React Native client to the FastAPI server on an RTX 3080 Ti showed the following single-request behavior with varying text lengths:
+
+| audio seconds | conditioning | T3 | S3Gen | generation | realtime factor |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `3.04s` | `0.29s` | `1.50s` | `0.78s` | `2.28s` | `1.33x` |
+| `3.00s` | `0.00s` | `1.43s` | `0.38s` | `1.81s` | `1.66x` |
+| `4.24s` | `0.00s` | `2.07s` | `0.46s` | `2.53s` | `1.67x` |
+| `5.76s` | `0.00s` | `2.69s` | `0.42s` | `3.11s` | `1.85x` |
+| `5.00s` | `0.00s` | `2.42s` | `0.40s` | `2.82s` | `1.77x` |
+
+Average across those `5` requests:
+
+- output audio: `4.208s`
+- generation time: `2.510s`
+- `T3`: `2.022s`
+- `S3Gen`: `0.488s`
+- realtime factor: `1.658x`
+
+Interpretation:
+
+- For single-request app traffic, the server is already returning full WAV output faster than the length of the generated audio on an RTX 3080 Ti.
+- The first request may pay a small conditioning/setup cost, but steady-state single-request performance is stronger than the synthetic burst-load tests suggest.
 
 ## Network Setup for React Native
 

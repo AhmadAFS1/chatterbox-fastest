@@ -298,6 +298,11 @@ class S3Token2Wav(S3Token2Mel):
         speech_feat = speech_feat.to(device=self.device, dtype=mel2wav_dtype)
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
+    def remove_weight_norm(self):
+        if hasattr(self.mel2wav, "f0_predictor") and hasattr(self.mel2wav.f0_predictor, "remove_weight_norm"):
+            self.mel2wav.f0_predictor.remove_weight_norm()
+        self.mel2wav.remove_weight_norm()
+
     @torch.inference_mode()
     def inference(
         self,

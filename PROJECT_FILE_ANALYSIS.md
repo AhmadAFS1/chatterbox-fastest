@@ -40,6 +40,7 @@ At a high level:
 
 - vLLM is used to accelerate the T3 autoregressive token generation stage.
 - Speaker/reference conditioning is cached to avoid recomputation.
+- The FastAPI server now micro-batches compatible requests instead of serializing every request behind a single generation lock.
 - The code uses several explicit workarounds to fit Chatterbox conditioning into vLLM's multimodal interfaces.
 - The S3 generation stage is still mostly the original-style PyTorch inference path rather than a vLLM-native port.
 
@@ -122,7 +123,8 @@ At a high level:
   - audio prompt upload handling
   - seed control
   - LRU-style conditioning cache keyed by SHA-256 of uploaded audio
-  - serialized generation via a `generation_lock`
+  - a micro-batching scheduler that groups compatible concurrent requests
+  - per-stage timing headers for queue wait, conditioning, T3, S3Gen, WAV encoding, and end-to-end latency
 - This is the main production-style entry point in the repo.
 
 #### `sample_tts_requests.http`
@@ -131,7 +133,7 @@ At a high level:
 
 #### `load_test_tts.sh`
 - Load-test helper for the FastAPI endpoint.
-- Spawns concurrent POST requests using an embedded Python script and reports throughput plus latency percentiles.
+- Spawns concurrent POST requests using an embedded Python script and reports throughput, latency percentiles, stage timings, batch sizes, and WAV validation status.
 - Useful for queueing and throughput experiments.
 
 #### `kill_gradio_tts_app.sh`
