@@ -59,10 +59,13 @@ Staggered-arrival findings:
 
 Multi-worker findings:
 
-* Two independent model processes on the same 12 GB GPU were viable at `gpu_memory_utilization=0.25` each.
-* In a round-robin `10`-request test across two `0.25` servers, combined throughput reached about `2.49 req/s`.
-* Each process only batched about `5` requests on average, so this trades some batch efficiency for lower queueing and parallel model copies.
-* This makes separate worker processes behind a reverse proxy a promising deployment option for short-request burst traffic.
+* Two independent model processes on the same 12 GB GPU were viable, but only with careful settings and startup order.
+* The stable multilingual two-worker setup used `gpu_memory_utilization=0.25` and `max_model_len=300`, and the workers had to be started sequentially. Starting both at once was less reliable because model load briefly spikes GPU memory usage.
+* In the main `2 workers` burst test, `10/10` requests were sent to each worker at the same time. All `20/20` requests succeeded, all returned valid WAVs, combined wall time was `7.716s`, and combined throughput was `2.592 req/s`.
+* Per worker in that same test, `avg_generation` was about `4.06s` to `4.10s` for about `2.712s` of audio, `avg_t3` was about `1.87s` to `1.91s`, `avg_s3gen=2.186s`, `avg_queue_wait` was about `1.43s`, and `avg_batch_requests=5.8`.
+* So the two-worker setup increased aggregate throughput, but it still did not deliver realtime per request under that `10 + 10 simultaneous` burst. The effective per-request realtime factor was about `0.66x`.
+* Lowering `max_model_len` to `200` was also stable, but it made each worker slower per request: `avg_generation` rose to about `5.59s` to `5.65s` for about `2.648s` of audio, even though combined throughput nudged up to `2.656 req/s`.
+* This makes separate worker processes behind a reverse proxy a promising deployment option for short-request burst traffic when total capacity matters more than single-request latency.
 * It is not the same as blindly raising `uvicorn workers`, because each worker duplicates the full model stack and needs explicit VRAM budgeting.
 
 Observed real app traces on the same RTX 3080 Ti:

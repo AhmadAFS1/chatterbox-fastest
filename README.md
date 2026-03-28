@@ -169,7 +169,12 @@ Other validated findings:
 * `diffusion_steps=3` is the most reliable request-level speed knob. It materially reduces `S3Gen` time, with an expected quality tradeoff.
 * A request that arrives while a batch is already running does not join that in-flight batch. In staggered tests, a second request sent `1.0s` later waited about `0.42s` at `gpu_memory_utilization=0.25` and about `0.82s` at `0.50`.
 * A request sent a few seconds later usually starts immediately. In staggered tests with a `3.0s` gap, queue wait stayed around `0.01s`.
-* If you want multiple model workers on a single 12 GB GPU, the promising pattern is separate server processes behind a reverse proxy or load balancer, not `uvicorn workers=2` on one port. In one test, two independent `0.25` servers reached about `2.49 req/s` combined throughput with `avg_batch_requests=5`, compared with about `1.43 req/s` for one `0.25` server handling the same `10` concurrent requests.
+* If you want multiple model workers on a single 12 GB GPU, the promising pattern is separate server processes behind a reverse proxy or load balancer, not `uvicorn workers=2` on one port.
+* A stable two-worker multilingual setup on this RTX 3080 Ti used `gpu_memory_utilization=0.25` and `max_model_len=300`, with the workers started sequentially rather than at the same time.
+* In that `2 workers` test, `10/10` requests were sent to each worker at the same time. All `20/20` requests succeeded with valid WAV output, combined wall time was `7.716s`, and combined throughput was `2.592 req/s`.
+* Per worker in that same test, `avg_generation` was about `4.06s` to `4.10s` for about `2.712s` of audio, with `avg_t3` around `1.87s` to `1.91s`, `avg_s3gen=2.186s`, `avg_queue_wait` around `1.43s`, and `avg_batch_requests=5.8`.
+* This means the two-worker setup improved aggregate throughput, but it was still not realtime per request under that `10 + 10 simultaneous` burst. The effective per-request realtime factor was about `0.66x`.
+* Reducing `max_model_len` further to `200` still fit, but it was worse for per-request speed: each worker stayed at `avg_batch_requests=10`, but `avg_generation` rose to about `5.59s` to `5.65s` for about `2.648s` of audio, even though combined throughput nudged up to `2.656 req/s`.
 * The two-process approach duplicates the full model stack in VRAM and reduces per-process batching, so it is best suited to short request workloads where lower queue time matters more than maximum batch size.
 
 Real app traces from a React Native client on the same RTX 3080 Ti showed stronger single-request behavior than the burst tests:
