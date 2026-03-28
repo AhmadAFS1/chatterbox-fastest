@@ -71,6 +71,7 @@ GPU_MEMORY_UTILIZATION = _env_float("CHATTERBOX_GPU_MEMORY_UTILIZATION", 0.5)
 ENABLE_SPLIT_SENTENCES_DEFAULT = _env_bool("CHATTERBOX_SPLIT_SENTENCES_DEFAULT", True)
 COMPILE = _env_bool("CHATTERBOX_COMPILE", False)
 CONDS_CACHE_SIZE = _env_int("CHATTERBOX_CONDS_CACHE_SIZE", 32)
+S3GEN_USE_FP16 = _env_bool("CHATTERBOX_S3GEN_USE_FP16", False)
 
 if MODEL_VARIANT not in {"english", "multilingual"}:
     raise ValueError("CHATTERBOX_MODEL_VARIANT must be either 'english' or 'multilingual'.")
@@ -90,13 +91,17 @@ def load_model() -> ChatterboxTTS:
     if global_model is not None:
         return global_model
 
-    print(f"Loading model variant={MODEL_VARIANT}...")
+    print(
+        f"Loading model variant={MODEL_VARIANT} "
+        f"s3gen_fp16={S3GEN_USE_FP16}..."
+    )
     if MODEL_VARIANT == "multilingual":
         global_model = ChatterboxTTS.from_pretrained_multilingual(
             max_batch_size=MAX_BATCH_SIZE,
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             max_model_len=MAX_MODEL_LEN,
             compile=COMPILE,
+            s3gen_use_fp16=S3GEN_USE_FP16,
         )
     else:
         global_model = ChatterboxTTS.from_pretrained(
@@ -104,6 +109,7 @@ def load_model() -> ChatterboxTTS:
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             max_model_len=MAX_MODEL_LEN,
             compile=COMPILE,
+            s3gen_use_fp16=S3GEN_USE_FP16,
         )
     return global_model
 

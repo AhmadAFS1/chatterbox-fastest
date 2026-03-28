@@ -289,8 +289,13 @@ class S3Token2Wav(S3Token2Mel):
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
+        mel2wav_dtype = next(self.mel2wav.parameters()).dtype
         if cache_source is None:
-            cache_source = torch.zeros(1, 1, 0).to(self.device)
+            cache_source = torch.zeros(1, 1, 0, device=self.device, dtype=mel2wav_dtype)
+        else:
+            cache_source = cache_source.to(device=self.device, dtype=mel2wav_dtype)
+
+        speech_feat = speech_feat.to(device=self.device, dtype=mel2wav_dtype)
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
@@ -65,7 +66,8 @@ class ChatterboxTTS:
                  t3: LLM, t3_config: T3Config, t3_cond_enc: T3CondEnc, 
                  t3_speech_emb: torch.nn.Embedding, t3_speech_pos_emb: LearnedPositionEmbeddings,
                  s3gen: S3Gen, ve: VoiceEncoder, default_conds: Conditionals,
-                 variant: str = "english"):
+                 variant: str = "english",
+                 s3gen_mixed_precision: bool = False):
         self.target_device = target_device
         self.max_model_len = max_model_len
         self.t3 = t3
@@ -78,6 +80,7 @@ class ChatterboxTTS:
         self.ve = ve
         self.default_conds = default_conds
         self.variant = variant
+        self.s3gen_mixed_precision = s3gen_mixed_precision
 
     @property
     def sr(self) -> int:
@@ -121,14 +124,18 @@ class ChatterboxTTS:
         vllm_memory_needed = (1.55*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 128)
         vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
 
-        print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+        effective_gpu_memory_utilization = kwargs.get("gpu_memory_utilization", vllm_memory_percent)
+        print(
+            f"Giving vLLM {effective_gpu_memory_utilization * 100:.2f}% of GPU memory "
+            f"({vllm_memory_needed / 1024**2:.2f} MB requested by heuristic)"
+        )
 
         base_vllm_kwargs = {
             "model": "./t3-model" if variant == "english" else "./t3-model-multilingual",
             "task": "generate",
             "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
             "tokenizer_mode": "custom",
-            "gpu_memory_utilization": vllm_memory_percent,
+            "gpu_memory_utilization": effective_gpu_memory_utilization,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
         }
@@ -139,7 +146,10 @@ class ChatterboxTTS:
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
         ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
+        # Use autocast-based mixed precision at inference time instead of
+        # converting the full S3Gen stack to half, which is brittle across the
+        # custom diffusion and HiFiGAN code paths.
+        s3gen = S3Gen(use_fp16=False)
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
@@ -151,6 +161,7 @@ class ChatterboxTTS:
             t3=t3, t3_config=t3_config, t3_cond_enc=t3_enc, t3_speech_emb=t3_speech_emb, t3_speech_pos_emb=t3_speech_pos_emb,
             s3gen=s3gen, ve=ve, default_conds=default_conds,
             variant=variant,
+            s3gen_mixed_precision=s3gen_use_fp16,
         )
 
     @classmethod
@@ -379,11 +390,17 @@ class ChatterboxTTS:
                     # Retry once on CUDA OOM; avoids paying `empty_cache()` sync cost on every call.
                     for attempt in range(max(0, s3gen_oom_retries) + 1):
                         try:
-                            wav, _ = self.s3gen.inference(
-                                speech_tokens=speech_tokens,
-                                ref_dict=s3gen_ref,
-                                n_timesteps=diffusion_steps,
+                            autocast_ctx = (
+                                torch.autocast(device_type="cuda", dtype=torch.float16)
+                                if self.s3gen_mixed_precision and torch.cuda.is_available()
+                                else nullcontext()
                             )
+                            with autocast_ctx:
+                                wav, _ = self.s3gen.inference(
+                                    speech_tokens=speech_tokens,
+                                    ref_dict=s3gen_ref,
+                                    n_timesteps=diffusion_steps,
+                                )
                             break
                         except RuntimeError as e:
                             is_oom = "out of memory" in str(e).lower()
@@ -391,7 +408,7 @@ class ChatterboxTTS:
                                 torch.cuda.empty_cache()
                                 continue
                             raise
-                    results.append(wav.cpu())
+                    results.append(wav.float().cpu())
             s3gen_gen_time = time.time() - start_time
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 

@@ -194,7 +194,7 @@ class SineGen(torch.nn.Module):
 
     def _f02uv(self, f0):
         # generate uv signal
-        uv = (f0 > self.voiced_threshold).type(torch.float32)
+        uv = (f0 > self.voiced_threshold).to(dtype=f0.dtype)
         return uv
 
     @torch.no_grad()
@@ -204,13 +204,20 @@ class SineGen(torch.nn.Module):
         :return: [B, 1, sample_len]
         """
 
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
+        F_mat = torch.zeros(
+            (f0.size(0), self.harmonic_num + 1, f0.size(-1)),
+            device=f0.device,
+            dtype=f0.dtype,
+        )
         for i in range(self.harmonic_num + 1):
             F_mat[:, i: i + 1, :] = f0 * (i + 1) / self.sampling_rate
 
         theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
         u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(
+            device=F_mat.device,
+            dtype=F_mat.dtype,
+        )
         phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
@@ -272,10 +279,13 @@ class SourceModuleHnNSF(torch.nn.Module):
         noise_source (batchsize, length 1)
         """
         # source for harmonic branch
+        target_dtype = self.l_linear.weight.dtype
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2))
             sine_wavs = sine_wavs.transpose(1, 2)
             uv = uv.transpose(1, 2)
+            sine_wavs = sine_wavs.to(dtype=target_dtype)
+            uv = uv.to(dtype=target_dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
@@ -396,7 +406,8 @@ class HiFTGenerator(nn.Module):
     def _stft(self, x):
         spec = torch.stft(
             x,
-            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"], window=self.stft_window.to(x.device),
+            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"],
+            window=self.stft_window.to(device=x.device, dtype=x.dtype),
             return_complex=True)
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
         return spec[..., 0], spec[..., 1]
@@ -406,7 +417,7 @@ class HiFTGenerator(nn.Module):
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
         inverse_transform = torch.istft(torch.complex(real, img), self.istft_params["n_fft"], self.istft_params["hop_len"],
-                                        self.istft_params["n_fft"], window=self.stft_window.to(magnitude.device))
+                                        self.istft_params["n_fft"], window=self.stft_window.to(device=magnitude.device, dtype=magnitude.dtype))
         return inverse_transform
 
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
@@ -448,11 +459,12 @@ class HiFTGenerator(nn.Module):
             batch: dict,
             device: torch.device,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        speech_feat = batch['speech_feat'].transpose(1, 2).to(device)
+        target_dtype = self.conv_pre.weight.dtype
+        speech_feat = batch['speech_feat'].transpose(1, 2).to(device=device, dtype=target_dtype)
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+        s = self.f0_upsamp(f0[:, None]).transpose(1, 2).to(dtype=target_dtype)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # mel+source->speech
@@ -461,10 +473,13 @@ class HiFTGenerator(nn.Module):
 
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        target_dtype = self.conv_pre.weight.dtype
+        speech_feat = speech_feat.to(dtype=target_dtype)
+        cache_source = cache_source.to(device=speech_feat.device, dtype=target_dtype)
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+        s = self.f0_upsamp(f0[:, None]).transpose(1, 2).to(dtype=target_dtype)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # use cache_source to avoid glitch
